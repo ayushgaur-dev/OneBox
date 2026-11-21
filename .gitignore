@@ -1,0 +1,45 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# SQLite database
+backend/onebox.db
+*.db
+*.sqlite3
+
+# Virtual environments
+venv/
+.venv/
+env/
+**/venv/
+**/.venv/
+backend/venv/
+
+# Node dependencies and build output
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+node_modules/
+dist/
+
+# Environment variables
+.env
+.env.local
+backend/.env
+*.env
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Editor / OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+#API KEY
+API_KEY.txt
