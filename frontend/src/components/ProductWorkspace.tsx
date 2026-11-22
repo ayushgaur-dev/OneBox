@@ -31,9 +31,12 @@ import {
   AlarmClock,
   CheckCheck,
   Clock3,
+  Download,
+  Paperclip,
+  Cloud,
 } from 'lucide-react';
 import { motion, useReducedMotion } from 'motion/react';
-import { api, Item, Category, OCRStatus, AIStatus, AIExtractResult, RemindersSummary } from '../api';
+import { api, Item, Category, OCRStatus, AIStatus, AIExtractResult, RemindersSummary, S3Status, UploadResult } from '../api';
 import {
   getUrgencyInfo,
   toInputDateTime,
@@ -126,11 +129,28 @@ export default function ProductWorkspace({ onBackToWebsite, isStandalone = false
   const [newActionItemInput, setNewActionItemInput] = useState<string>('');
   const [newDateInput, setNewDateInput] = useState<string>('');
 
+  // AWS S3 & Object Storage State (Milestone 4)
+  const [s3Status, setS3Status] = useState<S3Status | null>(null);
+  const [attachedFile, setAttachedFile] = useState<UploadResult | null>(null);
+  const [uploadingAttachment, setUploadingAttachment] = useState<boolean>(false);
+  const [attachmentUploadError, setAttachmentUploadError] = useState<string | null>(null);
+  const attachmentInputRef = useRef<HTMLInputElement>(null);
+
   // Edit Modal State
   const [editingItem, setEditingItem] = useState<Item | null>(null);
   const [editTitle, setEditTitle] = useState<string>('');
   const [editContent, setEditContent] = useState<string>('');
   const [editCategory, setEditCategory] = useState<Category>('NOTE');
+  const [editAttachedFile, setEditAttachedFile] = useState<{
+    file_name?: string | null;
+    file_size?: number | null;
+    file_type?: string | null;
+    s3_key?: string | null;
+    download_url?: string | null;
+  } | null>(null);
+  const [editClearAttachment, setEditClearAttachment] = useState<boolean>(false);
+  const [editUploadingAttachment, setEditUploadingAttachment] = useState<boolean>(false);
+  const editAttachmentInputRef = useRef<HTMLInputElement>(null);
   const [updating, setUpdating] = useState<boolean>(false);
   const [editError, setEditError] = useState<string | null>(null);
 
@@ -184,11 +204,22 @@ export default function ProductWorkspace({ onBackToWebsite, isStandalone = false
     }
   }, []);
 
+  // Check AWS S3 status
+  const checkS3Status = useCallback(async () => {
+    try {
+      const status = await api.getS3Status();
+      setS3Status(status);
+    } catch {
+      // Ignore background S3 status errors
+    }
+  }, []);
+
   useEffect(() => {
     loadItems();
     checkOCRStatus();
     checkAIStatus();
-  }, [loadItems, checkOCRStatus, checkAIStatus]);
+    checkS3Status();
+  }, [loadItems, checkOCRStatus, checkAIStatus, checkS3Status]);
 
   // Background Reminder Checker (runs every 30s)
   useEffect(() => {
@@ -311,7 +342,7 @@ export default function ProductWorkspace({ onBackToWebsite, isStandalone = false
     }
   };
 
-  // Run OCR Extraction
+  // Run OCR Extraction and preserve original object in AWS S3
   const handleExtractText = async () => {
     if (!selectedFile) {
       setOcrError('Please select or upload an image first.');
@@ -321,6 +352,14 @@ export default function ProductWorkspace({ onBackToWebsite, isStandalone = false
     try {
       setOcrLoading(true);
       setOcrError(null);
+
+      // Upload to S3 storage so screenshot object is preserved and downloadable
+      try {
+        const uploadRes = await api.uploadObject(selectedFile);
+        setAttachedFile(uploadRes);
+      } catch (uploadErr) {
+        console.warn('Screenshot upload to S3 backup failed:', uploadErr);
+      }
 
       const result = await api.extractTextFromImage(selectedFile);
       setExtractedFilename(result.filename);
@@ -340,6 +379,41 @@ export default function ProductWorkspace({ onBackToWebsite, isStandalone = false
       setOcrError(message);
     } finally {
       setOcrLoading(false);
+    }
+  };
+
+  // Upload an object (PDF, screenshot, notice, doc) directly to S3
+  const handleAttachmentUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    try {
+      setUploadingAttachment(true);
+      setAttachmentUploadError(null);
+      const res = await api.uploadObject(file);
+      setAttachedFile(res);
+
+      if (!newTitle.trim()) {
+        const cleanName = res.file_name.replace(/\.[^/.]+$/, '').replace(/[_.-]/g, ' ');
+        setNewTitle(cleanName);
+      }
+
+      if (res.ocr_text && !newContent.trim()) {
+        setNewContent(res.ocr_text);
+      }
+    } catch (err: unknown) {
+      setAttachmentUploadError(err instanceof Error ? err.message : 'Failed to upload file to storage');
+    } finally {
+      setUploadingAttachment(false);
+      if (e.target) e.target.value = '';
+    }
+  };
+
+  const handleRemoveAttachment = () => {
+    setAttachedFile(null);
+    setAttachmentUploadError(null);
+    if (attachmentInputRef.current) {
+      attachmentInputRef.current.value = '';
     }
   };
 
@@ -437,12 +511,17 @@ export default function ProductWorkspace({ onBackToWebsite, isStandalone = false
         content: finalContent,
         category: aiCategory,
         remind_at: aiRemindAt ? new Date(aiRemindAt).toISOString() : undefined,
+        file_name: attachedFile?.file_name,
+        file_size: attachedFile?.file_size,
+        file_type: attachedFile?.file_type,
+        s3_key: attachedFile?.s3_key,
+        s3_bucket: attachedFile?.s3_bucket,
       });
 
       setItems((prev) => [created, ...prev]);
       loadRemindersSummary();
 
-      // Reset form, proposal, and image
+      // Reset form, proposal, image, and attached file
       setNewTitle('');
       setNewContent('');
       setNewCategory('NOTE');
@@ -450,6 +529,7 @@ export default function ProductWorkspace({ onBackToWebsite, isStandalone = false
       setAiRemindAt('');
       setShowReminderPicker(false);
       setAiProposal(null);
+      setAttachedFile(null);
       handleClearImage();
       setCaptureMode('text');
     } catch (err: unknown) {
@@ -476,17 +556,23 @@ export default function ProductWorkspace({ onBackToWebsite, isStandalone = false
         content: newContent.trim(),
         category: newCategory,
         remind_at: newRemindAt ? new Date(newRemindAt).toISOString() : undefined,
+        file_name: attachedFile?.file_name,
+        file_size: attachedFile?.file_size,
+        file_type: attachedFile?.file_type,
+        s3_key: attachedFile?.s3_key,
+        s3_bucket: attachedFile?.s3_bucket,
       });
       setItems((prev) => [created, ...prev]);
       loadRemindersSummary();
 
-      // Reset form & image
+      // Reset form & image & attachment
       setNewTitle('');
       setNewContent('');
       setNewCategory('NOTE');
       setNewRemindAt('');
       setShowReminderPicker(false);
       setAiProposal(null);
+      setAttachedFile(null);
       handleClearImage();
       setCaptureMode('text');
     } catch (err: unknown) {
@@ -504,7 +590,42 @@ export default function ProductWorkspace({ onBackToWebsite, isStandalone = false
     setEditContent(item.content);
     setEditCategory(item.category);
     setEditRemindAt(toInputDateTime(item.remind_at));
+    setEditAttachedFile(item.s3_key ? {
+      file_name: item.file_name,
+      file_size: item.file_size,
+      file_type: item.file_type,
+      s3_key: item.s3_key,
+      download_url: item.download_url,
+    } : null);
+    setEditClearAttachment(false);
     setEditError(null);
+  };
+
+  // Upload attachment directly to existing item in edit modal
+  const handleEditAttachmentUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    if (!editingItem) return;
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    try {
+      setEditUploadingAttachment(true);
+      const updated = await api.uploadItemAttachment(editingItem.id, file);
+      setEditingItem(updated);
+      setEditAttachedFile({
+        file_name: updated.file_name,
+        file_size: updated.file_size,
+        file_type: updated.file_type,
+        s3_key: updated.s3_key,
+        download_url: updated.download_url,
+      });
+      setEditClearAttachment(false);
+      setItems((prev) => prev.map((item) => (item.id === updated.id ? updated : item)));
+    } catch (err: unknown) {
+      setEditError(err instanceof Error ? err.message : 'Failed to upload attachment');
+    } finally {
+      setEditUploadingAttachment(false);
+      if (e.target) e.target.value = '';
+    }
   };
 
   // Save Edit
@@ -525,6 +646,7 @@ export default function ProductWorkspace({ onBackToWebsite, isStandalone = false
         category: editCategory,
         remind_at: editRemindAt ? new Date(editRemindAt).toISOString() : null,
         clear_remind_at: !editRemindAt,
+        clear_attachment: editClearAttachment,
       });
 
       setItems((prev) => prev.map((item) => (item.id === updated.id ? updated : item)));
@@ -725,6 +847,28 @@ export default function ProductWorkspace({ onBackToWebsite, isStandalone = false
                     className={`w-1.5 h-1.5 rounded-full ${aiStatus?.available ? 'bg-emerald-400' : 'bg-amber-400'}`}
                   />
                   <span>AI: {aiStatus?.available ? aiStatus.model : 'No Key'}</span>
+                </span>
+                <span
+                  className="flex items-center space-x-1 px-2 py-0.5 rounded-md bg-slate-800 text-slate-300 border border-slate-700"
+                  title={s3Status?.message || 'AWS S3 Object Storage'}
+                >
+                  <span
+                    className={`w-1.5 h-1.5 rounded-full ${
+                      s3Status?.connected
+                        ? 'bg-emerald-400'
+                        : s3Status?.configured
+                        ? 'bg-amber-400'
+                        : 'bg-slate-400'
+                    }`}
+                  />
+                  <span>
+                    S3:{' '}
+                    {s3Status?.connected
+                      ? 'Connected'
+                      : s3Status?.configured
+                      ? 'Storage Active'
+                      : 'Local'}
+                  </span>
                 </span>
               </div>
 
@@ -1650,6 +1794,42 @@ export default function ProductWorkspace({ onBackToWebsite, isStandalone = false
                       </div>
                     )}
 
+                    {/* ATTACHED FILE CHIP (AWS S3) */}
+                    {attachedFile && (
+                      <div className="p-2.5 bg-blue-50/80 border border-blue-200 rounded-xl flex items-center justify-between text-xs">
+                        <div className="flex items-center space-x-2.5 min-w-0">
+                          <Paperclip className="w-4 h-4 text-blue-600 flex-shrink-0" />
+                          <div className="min-w-0">
+                            <span className="font-bold text-slate-900 truncate block">
+                              {attachedFile.file_name}
+                            </span>
+                            <span className="text-[11px] text-slate-500 flex items-center space-x-1.5 mt-0.5">
+                              <span>{(attachedFile.file_size / 1024).toFixed(1)} KB</span>
+                              <span>•</span>
+                              <span className="inline-flex items-center space-x-1 text-emerald-600 font-medium">
+                                <Cloud className="w-2.5 h-2.5" />
+                                <span>{attachedFile.stored_in_s3 ? 'Stored in S3' : 'Storage Ready'}</span>
+                              </span>
+                            </span>
+                          </div>
+                        </div>
+                        <button
+                          type="button"
+                          onClick={handleRemoveAttachment}
+                          className="text-slate-400 hover:text-red-600 p-1 rounded-md transition cursor-pointer"
+                          title="Remove attachment"
+                        >
+                          <X className="w-4 h-4" />
+                        </button>
+                      </div>
+                    )}
+                    {attachmentUploadError && (
+                      <p className="text-xs text-red-600 flex items-center space-x-1">
+                        <AlertCircle className="w-3.5 h-3.5" />
+                        <span>{attachmentUploadError}</span>
+                      </p>
+                    )}
+
                     {/* Controls Bar: Category Selector & Actions */}
                     <div className="flex flex-wrap items-center justify-between gap-3 pt-1">
                       <div className="flex flex-wrap items-center gap-2">
@@ -1690,6 +1870,37 @@ export default function ProductWorkspace({ onBackToWebsite, isStandalone = false
                           <AlarmClock className={`w-3.5 h-3.5 ${newRemindAt ? 'text-amber-600' : 'text-slate-400'}`} />
                           <span>{newRemindAt ? '⏰ Scheduled' : '+ Add Reminder'}</span>
                         </button>
+
+                        {/* Attach Object (AWS S3) File Input & Button */}
+                        <input
+                          ref={attachmentInputRef}
+                          type="file"
+                          onChange={handleAttachmentUpload}
+                          className="hidden"
+                          id="capture-attachment-input"
+                        />
+                        <label
+                          htmlFor="capture-attachment-input"
+                          className={`inline-flex items-center space-x-1 px-2.5 py-1 text-xs font-medium rounded-lg border transition cursor-pointer ${
+                            attachedFile
+                              ? 'bg-blue-100 text-blue-900 border-blue-300 font-semibold'
+                              : 'bg-white text-slate-600 border-slate-300 hover:bg-slate-50'
+                          }`}
+                          title="Attach screenshot, notice, PDF, or document to store in S3"
+                        >
+                          {uploadingAttachment ? (
+                            <RefreshCw className="w-3.5 h-3.5 animate-spin text-blue-600" />
+                          ) : (
+                            <Paperclip className={`w-3.5 h-3.5 ${attachedFile ? 'text-blue-600' : 'text-slate-400'}`} />
+                          )}
+                          <span>
+                            {uploadingAttachment
+                              ? 'Uploading...'
+                              : attachedFile
+                              ? '📎 Attached'
+                              : 'Attach Object'}
+                          </span>
+                        </label>
                       </div>
 
                       <div className="flex items-center space-x-2">
@@ -1895,6 +2106,50 @@ export default function ProductWorkspace({ onBackToWebsite, isStandalone = false
                           >
                             {item.content}
                           </p>
+
+                          {/* Attached Object (AWS S3) Download Bar */}
+                          {item.file_name && (
+                            <div className="mt-3 p-2.5 bg-slate-50 border border-slate-200 rounded-xl flex items-center justify-between gap-3">
+                              <div className="flex items-center space-x-2.5 min-w-0">
+                                <span className="w-8 h-8 rounded-lg bg-blue-100 text-blue-700 flex items-center justify-center flex-shrink-0">
+                                  {item.file_type?.includes('pdf') || item.file_name.endsWith('.pdf') ? (
+                                    <FileText className="w-4 h-4 text-rose-600" />
+                                  ) : item.file_type?.includes('image') || /\.(png|jpe?g|webp)$/i.test(item.file_name) ? (
+                                    <ImageIcon className="w-4 h-4 text-blue-600" />
+                                  ) : (
+                                    <FileText className="w-4 h-4 text-slate-600" />
+                                  )}
+                                </span>
+                                <div className="min-w-0">
+                                  <p className="text-xs font-bold text-slate-900 truncate" title={item.file_name}>
+                                    {item.file_name}
+                                  </p>
+                                  <div className="flex items-center space-x-2 text-[10px] text-slate-500">
+                                    <span>
+                                      {item.file_size ? `${(item.file_size / 1024).toFixed(1)} KB` : 'Object'}
+                                    </span>
+                                    <span>•</span>
+                                    <span className="inline-flex items-center space-x-1 text-emerald-600 font-medium">
+                                      <Cloud className="w-2.5 h-2.5" />
+                                      <span>AWS S3</span>
+                                    </span>
+                                  </div>
+                                </div>
+                              </div>
+
+                              <a
+                                href={item.download_url || api.getDownloadUrl(item.id)}
+                                download={item.file_name}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                className="inline-flex items-center space-x-1.5 px-3 py-1.5 bg-blue-600 hover:bg-blue-700 text-white rounded-lg text-xs font-semibold shadow-xs transition-colors flex-shrink-0 cursor-pointer"
+                                title={`Download ${item.file_name}`}
+                              >
+                                <Download className="w-3.5 h-3.5" />
+                                <span>Download</span>
+                              </a>
+                            </div>
+                          )}
                         </div>
 
                         {/* Footer: Timestamp, Reminder Info & Actions */}
@@ -2093,6 +2348,73 @@ export default function ProductWorkspace({ onBackToWebsite, isStandalone = false
                   required
                   className="w-full px-3.5 py-2.5 text-sm text-black font-semibold bg-white border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-600 focus:border-transparent resize-y transition leading-relaxed"
                 />
+              </div>
+
+              {/* Attached Object (AWS S3) in Edit Modal */}
+              <div className="p-3 bg-slate-50 border border-slate-200 rounded-xl space-y-2">
+                <label className="block text-xs font-semibold text-slate-700 uppercase tracking-wider">
+                  Attached Object (AWS S3)
+                </label>
+                {editAttachedFile && !editClearAttachment ? (
+                  <div className="flex items-center justify-between gap-3 p-2.5 bg-white border border-slate-200 rounded-lg">
+                    <div className="flex items-center space-x-2 min-w-0">
+                      <Paperclip className="w-4 h-4 text-blue-600 flex-shrink-0" />
+                      <div className="min-w-0 text-xs">
+                        <span className="font-bold text-slate-900 truncate block">
+                          {editAttachedFile.file_name}
+                        </span>
+                        <span className="text-[10px] text-slate-500">
+                          {editAttachedFile.file_size ? `${(editAttachedFile.file_size / 1024).toFixed(1)} KB` : 'Attached'}
+                        </span>
+                      </div>
+                    </div>
+                    <div className="flex items-center space-x-1.5 flex-shrink-0">
+                      <a
+                        href={editAttachedFile.download_url || (editingItem ? api.getDownloadUrl(editingItem.id) : '#')}
+                        download={editAttachedFile.file_name || undefined}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="px-2.5 py-1 text-xs font-semibold text-blue-600 bg-blue-50 hover:bg-blue-100 rounded-md transition"
+                      >
+                        Download
+                      </a>
+                      <button
+                        type="button"
+                        onClick={() => setEditClearAttachment(true)}
+                        className="px-2 py-1 text-xs text-red-600 hover:bg-red-50 rounded-md transition cursor-pointer"
+                        title="Remove attached file on save"
+                      >
+                        Remove
+                      </button>
+                    </div>
+                  </div>
+                ) : (
+                  <div>
+                    <input
+                      ref={editAttachmentInputRef}
+                      type="file"
+                      onChange={handleEditAttachmentUpload}
+                      className="hidden"
+                      id="edit-attachment-file-input"
+                    />
+                    <label
+                      htmlFor="edit-attachment-file-input"
+                      className="cursor-pointer inline-flex items-center space-x-1.5 px-3 py-1.5 text-xs font-semibold bg-white border border-slate-300 hover:bg-slate-100 rounded-lg text-slate-700 transition"
+                    >
+                      {editUploadingAttachment ? (
+                        <RefreshCw className="w-3.5 h-3.5 animate-spin text-blue-600" />
+                      ) : (
+                        <Upload className="w-3.5 h-3.5 text-slate-600" />
+                      )}
+                      <span>{editUploadingAttachment ? 'Uploading...' : 'Upload Attachment to S3'}</span>
+                    </label>
+                    {editClearAttachment && (
+                      <p className="text-[11px] text-amber-700 mt-1 font-medium">
+                        Attachment will be removed when you save changes.
+                      </p>
+                    )}
+                  </div>
+                )}
               </div>
 
               {editError && (

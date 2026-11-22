@@ -6,12 +6,21 @@ from enum import Enum
 from pathlib import Path
 from typing import List, Optional
 from fastapi import FastAPI, Depends, HTTPException, Query, status, File, UploadFile
+from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy.orm import Session
 from sqlalchemy import or_
 
 from smart_dates import parse_natural_date, get_reminder_urgency
+from s3 import (
+    upload_object,
+    get_object_stream,
+    get_presigned_download_url,
+    delete_object,
+    check_s3_status,
+    is_s3_configured,
+)
 
 # Safe dotenv loading (does not overwrite existing environment variables)
 try:
@@ -42,8 +51,9 @@ from ai import (
     GeminiResponseError,
 )
 
-# Maximum upload limit for OCR screenshots (10 MB)
-MAX_IMAGE_SIZE_BYTES = 10 * 1024 * 1024
+# Maximum upload limits
+MAX_IMAGE_SIZE_BYTES = 10 * 1024 * 1024  # 10 MB limit for OCR
+MAX_OBJECT_SIZE_BYTES = 25 * 1024 * 1024  # 25 MB limit for S3 objects (PDFs, screenshots, docs)
 SUPPORTED_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp"}
 SUPPORTED_CONTENT_TYPES = {"image/png", "image/jpeg", "image/jpg", "image/webp"}
 
@@ -52,8 +62,8 @@ init_db()
 
 app = FastAPI(
     title="OneBox API",
-    description="Backend API for OneBox personal information organizer with OCR screenshot extraction and Gemini AI intelligence",
-    version="1.2.1",
+    description="Backend API for OneBox personal information organizer with OCR screenshot extraction, Gemini AI intelligence, and AWS S3 storage",
+    version="1.3.0",
 )
 
 # CORS configuration for Vite / React dev servers
@@ -102,6 +112,11 @@ class ItemCreate(BaseModel):
     remind_at: Optional[datetime] = Field(default=None)
     reminder_status: Optional[str] = Field(default="PENDING")
     is_completed: Optional[bool] = Field(default=False)
+    file_name: Optional[str] = None
+    file_size: Optional[int] = None
+    file_type: Optional[str] = None
+    s3_key: Optional[str] = None
+    s3_bucket: Optional[str] = None
 
     @field_validator("content")
     @classmethod
@@ -130,6 +145,12 @@ class ItemUpdate(BaseModel):
     reminder_status: Optional[str] = None
     is_completed: Optional[bool] = None
     clear_remind_at: Optional[bool] = False
+    file_name: Optional[str] = None
+    file_size: Optional[int] = None
+    file_type: Optional[str] = None
+    s3_key: Optional[str] = None
+    s3_bucket: Optional[str] = None
+    clear_attachment: Optional[bool] = False
 
     @field_validator("content")
     @classmethod
@@ -160,11 +181,44 @@ class ItemResponse(BaseModel):
     remind_at: Optional[datetime] = None
     reminder_status: Optional[str] = "PENDING"
     is_completed: bool = False
+    file_name: Optional[str] = None
+    file_size: Optional[int] = None
+    file_type: Optional[str] = None
+    s3_key: Optional[str] = None
+    s3_bucket: Optional[str] = None
+    download_url: Optional[str] = None
     created_at: datetime
     updated_at: datetime
 
     class Config:
         from_attributes = True
+
+
+class UploadResponse(BaseModel):
+    file_name: str
+    file_size: int
+    file_type: str
+    s3_key: str
+    s3_bucket: str
+    stored_in_s3: bool
+    ocr_text: Optional[str] = None
+    download_url: Optional[str] = None
+    s3_error: Optional[str] = None
+
+
+class S3StatusResponse(BaseModel):
+    configured: bool
+    connected: bool
+    bucket: str
+    region: str
+    message: str
+
+
+class PresignedUrlResponse(BaseModel):
+    presigned_url: Optional[str] = None
+    direct_download_url: str
+    file_name: Optional[str] = None
+    file_size: Optional[int] = None
 
 
 class SnoozeRequest(BaseModel):
@@ -188,13 +242,15 @@ class OCRResponse(BaseModel):
 @app.get("/")
 def root():
     has_key = is_gemini_configured()
+    s3_cfg = is_s3_configured()
     return {
         "app": "OneBox API",
-        "version": "1.2.1",
+        "version": "1.3.0",
         "docs": "/docs",
         "status": "healthy",
         "ocr_available": is_tesseract_installed(),
         "ai_available": has_key,
+        "s3_available": s3_cfg,
     }
 
 
@@ -341,6 +397,200 @@ async def ai_extract(request: AIExtractRequest):
 
 
 # ==========================================
+# AWS S3 STORAGE & ATTACHMENT ENDPOINTS
+# ==========================================
+@app.get("/api/s3/status", response_model=S3StatusResponse)
+def s3_status():
+    """Check AWS S3 connection and bucket accessibility status."""
+    return check_s3_status()
+
+
+@app.post("/api/upload", response_model=UploadResponse)
+async def upload_file_object(file: UploadFile = File(...)):
+    """
+    Accept an uploaded object (screenshot, notice, PDF, document), store in AWS S3 (with local fallback),
+    and if it's an image, also extract text via OCR for immediate note population.
+    """
+    filename = file.filename or "upload"
+    content = await file.read()
+
+    if not content or len(content) == 0:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Uploaded file is empty. Please select a valid file."
+        )
+
+    if len(content) > MAX_OBJECT_SIZE_BYTES:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail=f"File exceeds maximum allowed size of {MAX_OBJECT_SIZE_BYTES // (1024 * 1024)}MB."
+        )
+
+    content_type = file.content_type or "application/octet-stream"
+    ext = Path(filename).suffix.lower()
+
+    # Upload to S3 (or fallback storage)
+    upload_res = await asyncio.to_thread(
+        upload_object,
+        file_bytes=content,
+        filename=filename,
+        content_type=content_type
+    )
+
+    # If it's an image and OCR is available, run OCR in worker thread
+    ocr_text = None
+    if ext in SUPPORTED_EXTENSIONS or content_type in SUPPORTED_CONTENT_TYPES:
+        try:
+            ocr_text = await asyncio.to_thread(extract_text_from_image, content)
+        except Exception as ocr_err:
+            logger.info("OCR not performed on uploaded image: %s", ocr_err)
+
+    return UploadResponse(
+        file_name=upload_res["file_name"],
+        file_size=upload_res["file_size"],
+        file_type=upload_res["file_type"],
+        s3_key=upload_res["s3_key"],
+        s3_bucket=upload_res["s3_bucket"],
+        stored_in_s3=upload_res["stored_in_s3"],
+        ocr_text=ocr_text,
+        download_url=None,
+        s3_error=upload_res.get("s3_error")
+    )
+
+
+@app.post("/api/items/{item_id}/upload", response_model=ItemResponse)
+async def upload_attachment_for_item(item_id: int, file: UploadFile = File(...), db: Session = Depends(get_db)):
+    """Upload and attach a file directly to an existing item."""
+    item = db.query(Item).filter(Item.id == item_id).first()
+    if not item:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Item with id {item_id} not found"
+        )
+
+    content = await file.read()
+    if not content or len(content) == 0:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Uploaded file is empty."
+        )
+
+    if len(content) > MAX_OBJECT_SIZE_BYTES:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail=f"File exceeds maximum allowed size of {MAX_OBJECT_SIZE_BYTES // (1024 * 1024)}MB."
+        )
+
+    # If item already had an attached object, clean it up
+    if item.s3_key:
+        await asyncio.to_thread(delete_object, item.s3_key, item.s3_bucket)
+
+    upload_res = await asyncio.to_thread(
+        upload_object,
+        file_bytes=content,
+        filename=file.filename or "attachment",
+        content_type=file.content_type or "application/octet-stream",
+        item_id=item_id
+    )
+
+    item.file_name = upload_res["file_name"]
+    item.file_size = upload_res["file_size"]
+    item.file_type = upload_res["file_type"]
+    item.s3_key = upload_res["s3_key"]
+    item.s3_bucket = upload_res["s3_bucket"]
+    item.updated_at = datetime.now(timezone.utc)
+    db.commit()
+    db.refresh(item)
+    return item
+
+
+@app.get("/api/items/{item_id}/download")
+async def download_item_object(item_id: int, db: Session = Depends(get_db)):
+    """Download the attached file object stored in S3 or local storage."""
+    item = db.query(Item).filter(Item.id == item_id).first()
+    if not item:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Item with id {item_id} not found"
+        )
+
+    if not item.s3_key:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="This item does not have any attached file object."
+        )
+
+    try:
+        stream_res = await asyncio.to_thread(get_object_stream, item.s3_key, item.s3_bucket)
+        stream_body, content_type, content_length, filename = stream_res
+
+        # If it's a botocore StreamingBody, read chunks
+        async def content_generator():
+            if hasattr(stream_body, "iter_chunks"):
+                for chunk in stream_body.iter_chunks(chunk_size=64 * 1024):
+                    yield chunk
+            elif hasattr(stream_body, "read"):
+                while chunk := stream_body.read(64 * 1024):
+                    yield chunk
+            elif callable(stream_body):
+                for chunk in stream_body():
+                    yield chunk
+            elif hasattr(stream_body, "__iter__"):
+                for chunk in stream_body:
+                    yield chunk
+
+        safe_filename = item.file_name or filename or "download"
+        headers = {
+            "Content-Disposition": f'attachment; filename="{safe_filename}"',
+            "Access-Control-Expose-Headers": "Content-Disposition",
+        }
+        if content_length:
+            headers["Content-Length"] = str(content_length)
+
+        return StreamingResponse(
+            content_generator(),
+            media_type=item.file_type or content_type or "application/octet-stream",
+            headers=headers
+        )
+    except FileNotFoundError:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Attached file not found in storage."
+        )
+    except Exception as e:
+        logger.error("Download error for item %d: %s", item_id, e)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to retrieve file: {str(e)}"
+        )
+
+
+@app.get("/api/items/{item_id}/presigned-url", response_model=PresignedUrlResponse)
+def get_item_presigned_url(item_id: int, db: Session = Depends(get_db)):
+    """Generate a presigned S3 URL for direct browser downloading if supported."""
+    item = db.query(Item).filter(Item.id == item_id).first()
+    if not item:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Item with id {item_id} not found"
+        )
+
+    if not item.s3_key:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="This item does not have any attached file object."
+        )
+
+    url = get_presigned_download_url(item.s3_key, item.file_name)
+    return PresignedUrlResponse(
+        presigned_url=url,
+        direct_download_url=f"/api/items/{item_id}/download",
+        file_name=item.file_name,
+        file_size=item.file_size,
+    )
+
+
+# ==========================================
 # CRUD ITEM ENDPOINTS
 # ==========================================
 @app.post("/api/items", response_model=ItemResponse, status_code=status.HTTP_201_CREATED)
@@ -360,6 +610,11 @@ def create_item(item_in: ItemCreate, db: Session = Depends(get_db)):
         remind_at=target_remind_at,
         reminder_status=item_in.reminder_status or "PENDING",
         is_completed=bool(item_in.is_completed),
+        file_name=item_in.file_name,
+        file_size=item_in.file_size,
+        file_type=item_in.file_type,
+        s3_key=item_in.s3_key,
+        s3_bucket=item_in.s3_bucket,
         created_at=datetime.now(timezone.utc),
         updated_at=datetime.now(timezone.utc),
     )
@@ -456,6 +711,26 @@ def update_item(item_id: int, item_in: ItemUpdate, db: Session = Depends(get_db)
             item.reminder_status = "PENDING"
         has_changes = True
 
+    if getattr(item_in, "clear_attachment", False):
+        if item.s3_key:
+            try:
+                delete_object(item.s3_key, item.s3_bucket)
+            except Exception:
+                pass
+        item.file_name = None
+        item.file_size = None
+        item.file_type = None
+        item.s3_key = None
+        item.s3_bucket = None
+        has_changes = True
+    elif item_in.s3_key is not None:
+        item.file_name = item_in.file_name
+        item.file_size = item_in.file_size
+        item.file_type = item_in.file_type
+        item.s3_key = item_in.s3_key
+        item.s3_bucket = item_in.s3_bucket
+        has_changes = True
+
     if has_changes:
         item.updated_at = datetime.now(timezone.utc)
         db.commit()
@@ -466,13 +741,19 @@ def update_item(item_id: int, item_in: ItemUpdate, db: Session = Depends(get_db)
 
 @app.delete("/api/items/{item_id}", status_code=status.HTTP_204_NO_CONTENT)
 def delete_item(item_id: int, db: Session = Depends(get_db)):
-    """Delete an item by its ID."""
+    """Delete an item by its ID, cleaning up any stored S3 object."""
     item = db.query(Item).filter(Item.id == item_id).first()
     if not item:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Item with id {item_id} not found"
         )
+
+    if item.s3_key:
+        try:
+            delete_object(item.s3_key, item.s3_bucket)
+        except Exception as e:
+            logger.warning("Failed to clean up object %s on delete: %s", item.s3_key, e)
 
     db.delete(item)
     db.commit()

@@ -28,6 +28,20 @@ class Item(Base):
     remind_at = Column(DateTime, nullable=True, index=True)
     reminder_status = Column(String(50), nullable=True, default="PENDING", index=True)
     is_completed = Column(Boolean, default=False, nullable=False, index=True)
+    
+    # S3 Object & Attachment Metadata
+    file_name = Column(String(255), nullable=True)
+    file_size = Column(Integer, nullable=True)
+    file_type = Column(String(100), nullable=True)
+    s3_key = Column(String(512), nullable=True, index=True)
+    s3_bucket = Column(String(255), nullable=True)
+
+    @property
+    def download_url(self) -> str | None:
+        if self.s3_key:
+            return f"/api/items/{self.id}/download"
+        return None
+
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
     updated_at = Column(
         DateTime,
@@ -53,6 +67,16 @@ def init_db():
                 conn.execute(text("ALTER TABLE items ADD COLUMN reminder_status VARCHAR(50) DEFAULT 'PENDING';"))
             if "is_completed" not in existing_columns:
                 conn.execute(text("ALTER TABLE items ADD COLUMN is_completed BOOLEAN DEFAULT 0;"))
+            if "file_name" not in existing_columns:
+                conn.execute(text("ALTER TABLE items ADD COLUMN file_name VARCHAR(255);"))
+            if "file_size" not in existing_columns:
+                conn.execute(text("ALTER TABLE items ADD COLUMN file_size INTEGER;"))
+            if "file_type" not in existing_columns:
+                conn.execute(text("ALTER TABLE items ADD COLUMN file_type VARCHAR(100);"))
+            if "s3_key" not in existing_columns:
+                conn.execute(text("ALTER TABLE items ADD COLUMN s3_key VARCHAR(512);"))
+            if "s3_bucket" not in existing_columns:
+                conn.execute(text("ALTER TABLE items ADD COLUMN s3_bucket VARCHAR(255);"))
             conn.commit()
     except Exception:
         pass

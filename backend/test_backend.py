@@ -381,7 +381,92 @@ def run_tests():
     client.delete(f"/api/items/{rem_id}")
     client.delete(f"/api/items/{overdue_id}")
 
-    print("\nALL BACKEND, OCR, GEMINI AI, AND SMART REMINDER TESTS PASSED SUCCESSFULLY! :)")
+    # ==========================================
+    # MILESTONE 4: AWS S3 & OBJECT STORAGE TESTS
+    # ==========================================
+    # 1. S3 Status Check
+    res = client.get("/api/s3/status")
+    assert res.status_code == 200, f"S3 status failed: {res.text}"
+    s3_status_data = res.json()
+    assert "configured" in s3_status_data
+    assert "bucket" in s3_status_data
+    assert "region" in s3_status_data
+    print(f"[PASS] S3 Status Check: configured={s3_status_data['configured']}, bucket={s3_status_data['bucket']}")
+
+    # 2. Upload Object (PDF / document / notice)
+    dummy_doc_content = b"%PDF-1.4 OneBox Notice Document Sample Content\nExam Schedule and Deadlines"
+    res = client.post(
+        "/api/upload",
+        files={"file": ("notice_exam.pdf", dummy_doc_content, "application/pdf")}
+    )
+    assert res.status_code == 200, f"Object upload failed: {res.text}"
+    upload_data = res.json()
+    assert upload_data["file_name"] == "notice_exam.pdf"
+    assert upload_data["file_size"] == len(dummy_doc_content)
+    assert upload_data["file_type"] == "application/pdf"
+    assert upload_data["s3_key"] is not None
+    print(f"[PASS] S3 Upload Object: key={upload_data['s3_key']}, size={upload_data['file_size']} bytes")
+
+    # 3. Create Note with attached S3 Object metadata
+    res = client.post(
+        "/api/items",
+        json={
+            "title": "Semester Final Exam Notice",
+            "content": "Official exam timetable for December 2026. Review attached PDF.",
+            "category": "DEADLINE",
+            "file_name": upload_data["file_name"],
+            "file_size": upload_data["file_size"],
+            "file_type": upload_data["file_type"],
+            "s3_key": upload_data["s3_key"],
+            "s3_bucket": upload_data["s3_bucket"],
+        }
+    )
+    assert res.status_code == 201, f"Failed to create item with S3 attachment: {res.text}"
+    item_with_obj = res.json()
+    assert item_with_obj["s3_key"] == upload_data["s3_key"]
+    assert item_with_obj["file_name"] == "notice_exam.pdf"
+    assert item_with_obj["download_url"] == f"/api/items/{item_with_obj['id']}/download"
+    obj_item_id = item_with_obj["id"]
+    print(f"[PASS] S3 Metadata in DB: item_id={obj_item_id}, download_url={item_with_obj['download_url']}")
+
+    # 4. Download Object via /api/items/{id}/download
+    res = client.get(f"/api/items/{obj_item_id}/download")
+    assert res.status_code == 200, f"Download failed: {res.text}"
+    assert res.content == dummy_doc_content, "Downloaded file content does not match uploaded content!"
+    assert "attachment" in res.headers.get("content-disposition", "")
+    print(f"[PASS] S3 Download Object: Verified {len(res.content)} bytes downloaded matching exact content")
+
+    # 5. Presigned URL endpoint
+    res = client.get(f"/api/items/{obj_item_id}/presigned-url")
+    assert res.status_code == 200
+    presigned_data = res.json()
+    assert presigned_data["direct_download_url"] == f"/api/items/{obj_item_id}/download"
+    print(f"[PASS] S3 Presigned URL: direct={presigned_data['direct_download_url']}")
+
+    # 6. Upload directly to existing item
+    res = client.post(
+        f"/api/items/{obj_item_id}/upload",
+        files={"file": ("updated_schedule.txt", b"Updated schedule notice details", "text/plain")}
+    )
+    assert res.status_code == 200
+    updated_item = res.json()
+    assert updated_item["file_name"] == "updated_schedule.txt"
+    print(f"[PASS] S3 Update Attachment directly: file_name={updated_item['file_name']}")
+
+    # Download updated attachment
+    res = client.get(f"/api/items/{obj_item_id}/download")
+    assert res.status_code == 200
+    assert res.content == b"Updated schedule notice details"
+    print("[PASS] S3 Download Updated Object verified")
+
+    # 7. Delete item and verify cleanup
+    res = client.delete(f"/api/items/{obj_item_id}")
+    assert res.status_code == 204
+    res = client.get(f"/api/items/{obj_item_id}/download")
+    assert res.status_code == 404
+    print("[PASS] S3 Cleanup on Item Delete verified")
+
+    print("\nALL BACKEND, OCR, GEMINI AI, SMART REMINDER, AND AWS S3 TESTS PASSED SUCCESSFULLY! :)")
 
 
 if __name__ == "__main__":
